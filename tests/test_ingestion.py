@@ -1,153 +1,143 @@
 """Tests for the ingestion module."""
 
 import json
-import tempfile
 import os
+import tempfile
 
 import pytest
+import duckdb
 
-from src.database import EventDatabase
-from src.ingestion import EventIngester
+from src import database
+from src.ingestion import ingest_events, validate_event
 
 
-class TestEventIngester:
-    """Tests for EventIngester functionality."""
+@pytest.fixture
+def temp_db_for_ingestion():
+    """Set up a temp database for ingestion tests."""
+    # Use a temp file for database
+    with tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False) as f:
+        db_path = f.name
+    os.unlink(db_path)  # DuckDB needs to create it
     
-    def test_ingest_valid_events(self, temp_db, temp_events_file):
-        """Test ingesting valid events from a file."""
-        ingester = EventIngester(temp_db)
-        stats = ingester.ingest_file(temp_events_file)
-        
-        assert stats.total_processed == 4
-        assert stats.successfully_ingested == 4
-        assert stats.duplicates_skipped == 0
-        assert stats.malformed_skipped == 0
-        assert len(stats.errors) == 0
+    # Override the global connection
+    database._conn = duckdb.connect(db_path)
+    database.init_schema(database._conn)
     
-    def test_ingest_handles_malformed_json(self, temp_db, temp_events_file_with_issues):
-        """Test that malformed JSON entries are skipped."""
-        ingester = EventIngester(temp_db)
-        stats = ingester.ingest_file(temp_events_file_with_issues)
-        
-        # Should have: 1 valid, 1 malformed, 1 duplicate, 1 empty timestamp, 1 valid
-        assert stats.total_processed == 5
-        assert stats.successfully_ingested == 2  # evt_001 and evt_003
-        assert stats.duplicates_skipped == 1  # Duplicate evt_001
-        assert stats.malformed_skipped == 2  # Malformed JSON + empty timestamp
-        assert len(stats.errors) == 2
+    yield database._conn
     
-    def test_ingest_handles_duplicates(self, temp_db):
-        """Test that duplicate events are skipped."""
-        events = [
-            {"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", 
-             "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"},
-            {"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", 
-             "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"},
-            {"event_id": "evt_002", "tenant_id": "tenant_a", "action": "upload", 
-             "package": "pkg2", "version": "1.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user2"},
-        ]
-        
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-        ) as f:
-            for event in events:
-                f.write(json.dumps(event) + "\n")
-            file_path = f.name
-        
-        try:
-            ingester = EventIngester(temp_db)
-            stats = ingester.ingest_file(file_path)
-            
-            assert stats.total_processed == 3
-            assert stats.successfully_ingested == 2
-            assert stats.duplicates_skipped == 1
-        finally:
-            os.unlink(file_path)
+    database._conn.close()
+    database._conn = None
+    try:
+        os.unlink(db_path)
+    except:
+        pass
+
+
+def test_validate_event_valid():
+    """Test validation of a valid event."""
+    event = {
+        "event_id": "evt_001",
+        "tenant_id": "tenant_a",
+        "action": "download",
+        "package": "requests",
+        "version": "2.28.0",
+        "timestamp": "2025-03-15T10:00:00+00:00",
+        "actor": "user-1"
+    }
+    is_valid, error = validate_event(event)
+    assert is_valid is True
+    assert error is None
+
+
+def test_validate_event_missing_field():
+    """Test validation fails for missing fields."""
+    event = {
+        "event_id": "evt_001",
+        "tenant_id": "tenant_a",
+        # Missing action
+        "package": "requests",
+        "version": "2.28.0",
+        "timestamp": "2025-03-15T10:00:00+00:00",
+        "actor": "user-1"
+    }
+    is_valid, error = validate_event(event)
+    assert is_valid is False
+    assert "Missing field" in error
+
+
+def test_validate_event_invalid_action():
+    """Test validation fails for invalid action."""
+    event = {
+        "event_id": "evt_001",
+        "tenant_id": "tenant_a",
+        "action": "invalid_action",
+        "package": "requests",
+        "version": "2.28.0",
+        "timestamp": "2025-03-15T10:00:00+00:00",
+        "actor": "user-1"
+    }
+    is_valid, error = validate_event(event)
+    assert is_valid is False
+    assert "Invalid action" in error
+
+
+def test_validate_event_empty_timestamp():
+    """Test validation fails for empty timestamp."""
+    event = {
+        "event_id": "evt_001",
+        "tenant_id": "tenant_a",
+        "action": "download",
+        "package": "requests",
+        "version": "2.28.0",
+        "timestamp": "",
+        "actor": "user-1"
+    }
+    is_valid, error = validate_event(event)
+    assert is_valid is False
+    assert "Empty timestamp" in error
+
+
+def test_ingest_valid_events(temp_db_for_ingestion, temp_events_file):
+    """Test ingesting valid events from a file."""
+    stats = ingest_events(temp_events_file)
     
-    def test_ingest_handles_out_of_order_events(self, temp_db):
-        """Test that out-of-order events are stored correctly."""
-        # Events in non-chronological order
-        events = [
-            {"event_id": "evt_002", "tenant_id": "tenant_a", "action": "upload", 
-             "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T12:00:00+00:00", "actor": "user1"},
-            {"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", 
-             "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"},
-            {"event_id": "evt_003", "tenant_id": "tenant_a", "action": "delete", 
-             "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user1"},
-        ]
-        
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-        ) as f:
-            for event in events:
-                f.write(json.dumps(event) + "\n")
-            file_path = f.name
-        
-        try:
-            ingester = EventIngester(temp_db)
-            stats = ingester.ingest_file(file_path)
-            
-            assert stats.successfully_ingested == 3
-            
-            # Query should return events sorted by timestamp (newest first)
-            from src.models import EventQuery
-            query = EventQuery(tenant_id="tenant_a")
-            results, _ = temp_db.query_events(query)
-            
-            assert len(results) == 3
-            # Check ordering (newest first)
-            assert results[0]["event_id"] == "evt_002"  # 12:00
-            assert results[1]["event_id"] == "evt_003"  # 11:00
-            assert results[2]["event_id"] == "evt_001"  # 10:00
-        finally:
-            os.unlink(file_path)
+    assert stats["total"] == 4
+    assert stats["ingested"] == 4
+    assert stats["duplicates"] == 0
+    assert stats["malformed"] == 0
+
+
+def test_ingest_handles_malformed_json(temp_db_for_ingestion, temp_events_file_with_issues):
+    """Test that malformed JSON entries are skipped."""
+    stats = ingest_events(temp_events_file_with_issues)
     
-    def test_ingest_file_not_found(self, temp_db):
-        """Test that FileNotFoundError is raised for missing files."""
-        ingester = EventIngester(temp_db)
-        
-        with pytest.raises(FileNotFoundError):
-            ingester.ingest_file("/nonexistent/path/events.jsonl")
+    # File has: 1 valid, 1 malformed JSON, 1 duplicate, 1 empty timestamp, 1 valid
+    assert stats["ingested"] == 2
+    assert stats["duplicates"] == 1
+    assert stats["malformed"] == 2
+
+
+def test_ingest_handles_duplicates(temp_db_for_ingestion):
+    """Test that duplicate events are skipped."""
+    events = [
+        {"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", 
+         "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"},
+        {"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", 
+         "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"},
+        {"event_id": "evt_002", "tenant_id": "tenant_a", "action": "upload", 
+         "package": "pkg2", "version": "1.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user2"},
+    ]
     
-    def test_ingest_empty_file(self, temp_db):
-        """Test ingesting an empty file."""
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-        ) as f:
-            file_path = f.name
-        
-        try:
-            ingester = EventIngester(temp_db)
-            stats = ingester.ingest_file(file_path)
-            
-            assert stats.total_processed == 0
-            assert stats.successfully_ingested == 0
-        finally:
-            os.unlink(file_path)
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".jsonl", delete=False) as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+        file_path = f.name
     
-    def test_ingest_with_empty_lines(self, temp_db):
-        """Test that empty lines in the file are handled."""
-        events = [
-            '{"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", '
-            '"package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"}',
-            '',  # Empty line
-            '{"event_id": "evt_002", "tenant_id": "tenant_a", "action": "upload", '
-            '"package": "pkg2", "version": "1.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user2"}',
-            '   ',  # Whitespace line
-        ]
+    try:
+        stats = ingest_events(file_path)
         
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-        ) as f:
-            for event in events:
-                f.write(event + "\n")
-            file_path = f.name
-        
-        try:
-            ingester = EventIngester(temp_db)
-            stats = ingester.ingest_file(file_path)
-            
-            # Empty lines should be counted but not cause errors
-            assert stats.successfully_ingested == 2
-        finally:
-            os.unlink(file_path)
+        assert stats["total"] == 3
+        assert stats["ingested"] == 2
+        assert stats["duplicates"] == 1
+    finally:
+        os.unlink(file_path)

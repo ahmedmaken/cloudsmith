@@ -1,43 +1,28 @@
-"""Test fixtures and configuration for pytest."""
+"""Test fixtures for pytest."""
 
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
 
 import pytest
+import duckdb
 
-from src.database import EventDatabase, reset_database
+from src import database
 
 
 @pytest.fixture
 def temp_db():
-    """Create a temporary database for testing."""
-    # Create a temp file name but delete the file so DuckDB can create it fresh
-    with tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False) as f:
-        db_path = f.name
-    
-    # Delete the empty file - DuckDB needs to create it fresh
-    os.unlink(db_path)
-    
-    db = EventDatabase(db_path)
-    yield db
-    
-    db.close()
-    try:
-        os.unlink(db_path)
-    except OSError:
-        pass
-    # Also clean up any WAL files
-    try:
-        os.unlink(db_path + ".wal")
-    except OSError:
-        pass
+    """Create a temporary in-memory database for testing."""
+    # Use in-memory database
+    conn = duckdb.connect(":memory:")
+    database.init_schema(conn)
+    yield conn
+    conn.close()
 
 
 @pytest.fixture
 def sample_events():
-    """Sample events for testing."""
+    """Sample valid events for testing."""
     return [
         {
             "event_id": "evt_001",
@@ -80,50 +65,29 @@ def sample_events():
 
 @pytest.fixture
 def temp_events_file(sample_events):
-    """Create a temporary events file for testing."""
-    with tempfile.NamedTemporaryFile(
-        mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-    ) as f:
+    """Create a temp file with sample events."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".jsonl", delete=False) as f:
         for event in sample_events:
             f.write(json.dumps(event) + "\n")
-        file_path = f.name
-    
-    yield file_path
-    
-    try:
-        os.unlink(file_path)
-    except OSError:
-        pass
+        path = f.name
+    yield path
+    os.unlink(path)
 
 
 @pytest.fixture
 def temp_events_file_with_issues():
-    """Create a temporary events file with malformed entries and duplicates."""
+    """Create a temp file with some malformed events."""
     events = [
         '{"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"}',
-        '{malformed json',  # Malformed
+        '{invalid json',  # Malformed
         '{"event_id": "evt_001", "tenant_id": "tenant_a", "action": "download", "package": "pkg1", "version": "1.0", "timestamp": "2025-03-15T10:00:00+00:00", "actor": "user1"}',  # Duplicate
-        '{"event_id": "evt_002", "tenant_id": "tenant_a", "action": "upload", "package": "pkg2", "version": "1.0", "timestamp": "", "actor": "user2"}',  # Empty timestamp
-        '{"event_id": "evt_003", "tenant_id": "tenant_b", "action": "download", "package": "pkg3", "version": "2.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user3"}',
+        '{"event_id": "evt_002", "tenant_id": "tenant_a", "action": "download", "package": "pkg2", "version": "1.0", "timestamp": "", "actor": "user2"}',  # Empty timestamp
+        '{"event_id": "evt_003", "tenant_id": "tenant_a", "action": "download", "package": "pkg3", "version": "1.0", "timestamp": "2025-03-15T11:00:00+00:00", "actor": "user3"}'
     ]
     
-    with tempfile.NamedTemporaryFile(
-        mode='w', suffix=".jsonl", delete=False, encoding='utf-8'
-    ) as f:
-        for event in events:
-            f.write(event + "\n")
-        file_path = f.name
-    
-    yield file_path
-    
-    try:
-        os.unlink(file_path)
-    except OSError:
-        pass
-
-
-@pytest.fixture(autouse=True)
-def cleanup_database():
-    """Clean up the global database after each test."""
-    yield
-    reset_database()
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".jsonl", delete=False) as f:
+        for line in events:
+            f.write(line + "\n")
+        path = f.name
+    yield path
+    os.unlink(path)
